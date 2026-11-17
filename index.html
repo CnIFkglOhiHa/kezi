@@ -85,28 +85,6 @@
                         return currentDomain + window.location.pathname + (qs ? '?' + qs : '');
                     }
 
-                    // 微信 H5 授权：无 accessToken 时先走 oauth-jump 一次直达微信授权，回跳本页带上 accessToken 再继续
-                    let oauthRedirecting = false;
-                    if (isWeChatBrowser && !urlParams.accessToken && !oauthFailed) {
-                        oauthRedirecting = true;
-                        const returnUrl = buildShellReturnUrl();
-                        fetch(`${apiBase}/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(urlParams.t)}&v=${encodeURIComponent(urlParams.v)}&returnUrl=${encodeURIComponent(returnUrl)}`, {
-                            headers: {
-                                "channel-type": channelType,
-                            },
-                        })
-                            .then((response) => response.json())
-                            .then((res) => {
-                                if (res && res.code === 0 && res.data) {
-                                    console.log("跳转微信授权:", res.data);
-                                    location.href = res.data;
-                                }
-                            })
-                            .catch((err) => {
-                                console.error("获取微信授权地址失败：", err);
-                            });
-                    }
-
                     // 获取 iframe 元素
                     const iframe = document.getElementById('dynamicIframe');
                     const loading = document.getElementById('loading');
@@ -153,7 +131,7 @@
                      * 补登录态；失效域名场景附带新分享链供平台展示。
                      *
                      * @param {string} link 落地校验返回的平台链接
-                     * @param {{fromInvalidDomain?: boolean, redirectLink?: string}} extra 附加参数
+                     * @param {{fromInvalidDomain?: boolean, redirectLink?: string, tenantId?: number|string}} extra 附加参数
                      * @returns {string} 最终跳转 URL
                      */
                     function buildPlatformJumpUrl(link, extra) {
@@ -178,12 +156,20 @@
                             }
                         });
                         url.search = '';
-                        // 2. 补登录态与失效域名提示参数
+                        // 2. 补登录态。场景、模块、目标仍走 /context，不放进地址
+                        params.delete('sceneType');
+                        params.delete('moduleCode');
+                        params.delete('targetId');
                         if (accessToken) {
                             params.set('accessToken', accessToken);
                         }
                         if (refreshToken) {
                             params.set('refreshToken', refreshToken);
+                        }
+                        // 平台启动时没有租户号会清掉刚写入的登录态。只带落地校验返回的租户号
+                        const tenantId = extra && extra.tenantId != null ? String(extra.tenantId).trim() : '';
+                        if (/^[1-9]\d*$/.test(tenantId)) {
+                            params.set('tenantId', tenantId);
                         }
                         if (extra && extra.fromInvalidDomain && extra.redirectLink) {
                             params.set('fromInvalidDomain', '1');
@@ -205,8 +191,8 @@
 
                     console.log(`请求落地风控: ${verifyUrl}`);
 
-                    // 微信授权回跳中（待跳授权）时跳过校验，避免重复请求
-                    if (!oauthRedirecting) {
+                    // 落地风控：通过后 iframe 打开平台。授权地址拿失败时也会走到这里，按游客继续
+                    function landVerify() {
                         fetch(verifyUrl, {
                             method: "POST",
                             headers: {
@@ -221,7 +207,7 @@
                                 console.log("落地风控返回:", res);
                                 // yudao CommonResult：code=0 成功
                                 if (res && res.code === 0 && res.data) {
-                                    const { pass, interceptUrl, fromInvalidDomain, redirectLink, link } = res.data;
+                                    const { pass, interceptUrl, fromInvalidDomain, redirectLink, link, tenantId } = res.data;
                                     if (pass) {
                                         if (!link) {
                                             loading.textContent = "加载失败，请稍后再试。";
@@ -231,6 +217,7 @@
                                         const target = buildPlatformJumpUrl(link, {
                                             fromInvalidDomain: !!fromInvalidDomain,
                                             redirectLink: redirectLink || '',
+                                            tenantId: tenantId,
                                         });
                                         console.log("iframe 打开平台 H5:", target);
                                         showIframe(target);
@@ -250,6 +237,36 @@
                             });
                     }
 
+                    // 1. 微信且还没有登录态：先拿授权地址，成功则顶层去微信，回跳本页后再落地
+                    // 2. 授权地址失败：写出原因，按游客落地，避免停在「加载中」
+                    if (isWeChatBrowser && !accessToken && !oauthFailed) {
+                        const returnUrl = buildShellReturnUrl();
+                        fetch(`${apiBase}/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(t)}&v=${encodeURIComponent(v)}&returnUrl=${encodeURIComponent(returnUrl)}`, {
+                            headers: {
+                                "channel-type": channelType,
+                            },
+                        })
+                            .then((response) => response.json())
+                            .then((res) => {
+                                if (res && res.code === 0 && res.data) {
+                                    console.log("跳转微信授权:", res.data);
+                                    location.href = res.data;
+                                    return;
+                                }
+                                const msg = (res && res.msg) ? res.msg : "获取微信授权地址失败";
+                                console.error("获取微信授权地址失败：", res);
+                                loading.textContent = msg;
+                                landVerify();
+                            })
+                            .catch((err) => {
+                                console.error("获取微信授权地址失败：", err);
+                                loading.textContent = "获取微信授权地址失败，请检查网络连接。";
+                                landVerify();
+                            });
+                    } else {
+                        landVerify();
+                    }
+
                     // 复制新分享链接
                     document.getElementById('copyLink').addEventListener('click', function() {
                         const link = document.getElementById('newLink').value;
@@ -264,15 +281,37 @@
                         }
                     });
 
-                    // 监听 postMessage 消息，用于 iframe 内部通知外层跳转
+                    // 监听 postMessage：iframe 内换页仍留在 iframe；微信授权必须交给顶层窗口，否则微信提示「请在微信客户端打开链接」
                     window.addEventListener("message", function(event) {
                         if (!allowedFrameOrigin || event.origin !== allowedFrameOrigin) {
                             return;
                         }
-                        if (event.data && event.data.action === "redirect") {
+                        if (!event.data || !event.data.url) {
+                            return;
+                        }
+                        if (event.data.action === "redirect") {
                             console.log(`收到 postMessage 跳转指令，iframe 加载: ${event.data.url}`);
-                            // 使用 iframe 加载新页面
                             showIframe(event.data.url);
+                            return;
+                        }
+                        if (event.data.action === "wechatOAuth") {
+                            // 分享链路已把 accessToken 带回壳子。再把顶层窗口送去授权，回来会落在平台登录页，分享页进不去
+                            if (accessToken) {
+                                console.log("壳子已有登录态，忽略微信授权跳转");
+                                return;
+                            }
+                            let oauthUrl;
+                            try {
+                                oauthUrl = new URL(event.data.url);
+                            } catch (e) {
+                                return;
+                            }
+                            // 只放行微信网页授权，避免平台页把顶层窗口带到其它地址
+                            if (oauthUrl.protocol !== 'https:' || oauthUrl.hostname !== 'open.weixin.qq.com') {
+                                return;
+                            }
+                            console.log('顶层窗口打开微信授权:', oauthUrl.toString());
+                            location.href = oauthUrl.toString();
                         }
                     });
 
